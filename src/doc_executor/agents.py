@@ -1,3 +1,4 @@
+import ast
 import re
 from pathlib import Path
 from typing import Dict
@@ -16,10 +17,23 @@ from doc_executor.models import average_confidence
 from doc_executor.text import lines_to_text
 
 
+SETTINGS_FILE_PATTERNS = [
+    "settings.py",
+    "settings/*.py",
+    "settings/**/*.py",
+]
+
+MODEL_FILE_PATTERNS = [
+    "models.py",
+    "models/*.py",
+    "models/**/*.py",
+]
+
+
 class ProjectProfileAgent:
     def run(self, repo_path: Path, rules: RuleSet, rules_path: Path) -> ProjectProfile:
-        settings_files = list(repo_path.rglob("settings.py"))
-        model_files = list(repo_path.rglob("models.py"))
+        settings_files = self._find_repo_files(repo_path, SETTINGS_FILE_PATTERNS)
+        model_files = self._find_repo_files(repo_path, MODEL_FILE_PATTERNS)
         url_files = list(repo_path.rglob("urls.py"))
         test_files = list(repo_path.rglob("test*.py"))
         service_patterns = []
@@ -61,12 +75,26 @@ class ProjectProfileAgent:
             confidence=confidence,
         )
 
+    def _find_repo_files(self, repo_path: Path, patterns: List[str]) -> List[Path]:
+        files: List[Path] = []
+        seen = set()
+        for pattern in patterns:
+            for path in repo_path.rglob(pattern):
+                if path.name == "__init__.py":
+                    continue
+                text_key = str(path)
+                if text_key in seen:
+                    continue
+                seen.add(text_key)
+                files.append(path)
+        files.sort()
+        return files
+
     def _detect_apps(self, settings_files: List[Path]) -> List[str]:
         apps = []
-        pattern = re.compile(r"['\"]([a-zA-Z0-9_\\.]+)['\"]")
         for path in settings_files:
             content = path.read_text(encoding="utf-8")
-            for match in pattern.findall(content):
+            for match in self._extract_installed_apps(content):
                 if match.startswith("django."):
                     continue
                 if match not in apps:
@@ -75,13 +103,10 @@ class ProjectProfileAgent:
 
     def _detect_models(self, model_files: List[Path], repo_path: Path) -> List[Dict[str, str]]:
         models = []
-        pattern = re.compile(r"class\\s+([A-Za-z0-9_]+)\\(models\\.Model\\):")
         for path in model_files:
             content = path.read_text(encoding="utf-8")
-            app_name = path.parent.name
-            if path.parent.name == "models":
-                app_name = path.parent.parent.name
-            for class_name in pattern.findall(content):
+            app_name = self._infer_app_name(path)
+            for class_name in self._extract_model_class_names(content):
                 models.append(
                     {
                         "name": class_name,
@@ -93,10 +118,12 @@ class ProjectProfileAgent:
 
     def _detect_routes(self, url_files: List[Path], repo_path: Path) -> List[Dict[str, str]]:
         routes = []
-        pattern = re.compile(r"['\"](/[^'\"]*)['\"]")
         for path in url_files:
             content = path.read_text(encoding="utf-8")
-            for route_path in pattern.findall(content):
+            parsed_routes = self._extract_route_paths(content)
+            if not parsed_routes:
+                parsed_routes = self._extract_route_paths_with_regex(content)
+            for route_path in parsed_routes:
                 routes.append(
                     {
                         "path": route_path,
@@ -104,6 +131,163 @@ class ProjectProfileAgent:
                     }
                 )
         return routes
+
+    def _extract_installed_apps(self, content: str) -> List[str]:
+        apps: List[str] = []
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            return apps
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == "INSTALLED_APPS":
+                        apps.extend(self._extract_string_literals(node.value))
+            if isinstance(node, ast.AugAssign):
+                if isinstance(node.target, ast.Name) and node.target.id == "INSTALLED_APPS":
+                    apps.extend(self._extract_string_literals(node.value))
+            if isinstance(node, ast.Expr):
+                value = node.value
+                if not isinstance(value, ast.Call):
+                    continue
+                if not isinstance(value.func, ast.Attribute):
+                    continue
+                if value.func.attr != "append":
+                    continue
+                if not isinstance(value.func.value, ast.Name):
+                    continue
+                if value.func.value.id != "INSTALLED_APPS":
+                    continue
+                if len(value.args) != 1:
+                    continue
+                apps.extend(self._extract_string_literals(value.args[0]))
+        return apps
+
+    def _extract_string_literals(self, node: ast.AST) -> List[str]:
+        values: List[str] = []
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            values.append(node.value)
+            return values
+        if isinstance(node, ast.JoinedStr):
+            text = ""
+            for value in node.values:
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    text += value.value
+            if text:
+                values.append(text)
+            return values
+        if isinstance(node, ast.List) or isinstance(node, ast.Tuple) or isinstance(node, ast.Set):
+            for item in node.elts:
+                values.extend(self._extract_string_literals(item))
+            return values
+        return values
+
+    def _extract_model_class_names(self, content: str) -> List[str]:
+        names: List[str] = []
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            return names
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            if self._class_looks_like_model(node):
+                names.append(node.name)
+        return names
+
+    def _class_looks_like_model(self, node: ast.ClassDef) -> bool:
+        has_field_assignment = False
+        has_db_table = False
+        for child in node.body:
+            value = None
+            if isinstance(child, ast.Assign):
+                value = child.value
+            if isinstance(child, ast.AnnAssign):
+                value = child.value
+            if value is not None and self._is_models_call(value):
+                has_field_assignment = True
+            if isinstance(child, ast.ClassDef) and child.name == "Meta":
+                if self._meta_defines_db_table(child):
+                    has_db_table = True
+        return has_field_assignment or has_db_table
+
+    def _is_models_call(self, node: ast.AST) -> bool:
+        if not isinstance(node, ast.Call):
+            return False
+        if not isinstance(node.func, ast.Attribute):
+            return False
+        if not isinstance(node.func.value, ast.Name):
+            return False
+        return node.func.value.id == "models"
+
+    def _meta_defines_db_table(self, node: ast.ClassDef) -> bool:
+        for child in node.body:
+            if not isinstance(child, ast.Assign):
+                continue
+            for target in child.targets:
+                if isinstance(target, ast.Name) and target.id == "db_table":
+                    return True
+        return False
+
+    def _infer_app_name(self, path: Path) -> str:
+        parts = list(path.parts)
+        if "models" in parts:
+            model_index = parts.index("models")
+            if model_index > 0:
+                return parts[model_index - 1]
+        if path.parent.name == "models":
+            return path.parent.parent.name
+        return path.parent.name
+
+    def _extract_route_paths(self, content: str) -> List[str]:
+        routes: List[str] = []
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            return routes
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func_name = self._call_name(node.func)
+            if func_name not in ["path", "re_path", "register"]:
+                continue
+            if not node.args:
+                continue
+            route_path = self._extract_route_text(node.args[0])
+            if route_path and route_path not in routes:
+                routes.append(route_path)
+        return routes
+
+    def _extract_route_paths_with_regex(self, content: str) -> List[str]:
+        pattern = re.compile(r"['\"]([^'\"]*/)['\"]")
+        routes: List[str] = []
+        for value in pattern.findall(content):
+            if "/" not in value:
+                continue
+            route = value
+            if not route.startswith("/"):
+                route = "/" + route
+            if route not in routes:
+                routes.append(route)
+        return routes
+
+    def _call_name(self, node: ast.AST) -> str:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return node.attr
+        return ""
+
+    def _extract_route_text(self, node: ast.AST) -> str:
+        values = self._extract_string_literals(node)
+        if not values:
+            return ""
+        route = values[0]
+        if not route:
+            return ""
+        if not route.startswith("/"):
+            route = "/" + route
+        return route
 
 
 class DocumentNormalizationAgent:
